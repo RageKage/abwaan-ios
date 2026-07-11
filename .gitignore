@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Xcode
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+*.moved-aside
+
+# Swift Package Manager
+.swiftpm/
+.build/
+
+# Firebase
+firebase/.runtimeconfig.json
+firebase/**/node_modules/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+firebase/functions/lib/
+
+# Secrets — the PRODUCTION GoogleService-Info.plist should never be committed.
+# The dev plist is safe (it ships in the app bundle anyway); keep it out of the
+# prod config folder to be safe once the two-plist split lands (10 §3).
+GoogleService-Info-Prod.plist

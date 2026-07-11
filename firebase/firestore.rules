@@ -1,0 +1,13 @@
+rules_version = '2';
+
+// ⚠️ M0 PLACEHOLDER ONLY — allow-all so the emulator starts and the spike can
+// read/write freely. This is NOT the real ruleset. The real, locked-down rules
+// are written at M1 (see ios-rebuild-docs/10-TECH-PLAN.md §4 and 11-RISKS.md R8).
+// Do NOT deploy this to any real project.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if true;
+    }
+  }
+}
