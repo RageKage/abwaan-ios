@@ -1,0 +1,15 @@
+{
+  "name": "abwaan-firestore-rules-tests",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Rules unit tests for the Abwaan v2 Firestore ruleset (M1). The rules are the only real security in this system (11-RISKS.md R8), so every rule gets a test proving both the allow case and the negative case.",
+  "scripts": {
+    "test": "firebase emulators:exec --only firestore --config ../firebase.json --project demo-abwaan \"node --test\"",
+    "test:watch": "node --test --watch"
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^4.0.1",
+    "firebase": "^11.6.0"
+  }
+}

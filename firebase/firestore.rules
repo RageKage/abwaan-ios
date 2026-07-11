@@ -1,13 +1,235 @@
 rules_version = '2';
 
-// ⚠️ M0 PLACEHOLDER ONLY — allow-all so the emulator starts and the spike can
-// read/write freely. This is NOT the real ruleset. The real, locked-down rules
-// are written at M1 (see ios-rebuild-docs/10-TECH-PLAN.md §4 and 11-RISKS.md R8).
-// Do NOT deploy this to any real project.
+// Abwaan — Firestore security rules, schema v2 (M1).
+//
+// The client is NOT the authority; these rules are. See 10-TECH-PLAN.md §4 and
+// 11-RISKS.md R8. This is a full rewrite of the retired web ruleset, not a port —
+// but the web app's paranoia (exact-key-set checks, !exists() guards, pinned
+// immutable fields) is copied deliberately where it was correct.
+//
+// v2 structural changes from the web rules:
+//   • isAdmin() → custom claim (request.auth.token.admin), no get(), no read cost.
+//   • Timestamps are serverTimestamp(): client-written createdAt == request.time.
+//   • Submissions are CALLABLE-WRITE-ONLY except delete (13 §A4). create/update = false;
+//     content edits, status changes, and votes all flow through Cloud Functions
+//     (which use the Admin SDK and bypass these rules).
+//   • profiles/privateUsers are created by the bootstrapProfile callable (13 §A2),
+//     so client create = false. Clients only update displayName/bio (profiles) and
+//     blockedUids (privateUsers, capped ≤ 500, 13 §A7).
+//   • usernames registry is callable-write-only (claimUsername) and carries no uid (13 §A5).
+//   • The username gate is REAL here: comment/report create assert the author
+//     profile's username != null (13 §A8) — not a client-only check.
+//
+// Direct client writes (deliberately, so the Firestore SDK queues them offline):
+//   comment create/delete, favorites, report create, profile displayName/bio,
+//   blockedUids, submission delete. Everything else is a callable.
+
 service cloud.firestore {
   match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    // Custom claim on the ID token — no profile get(), unlike the web's isAdmin().
+    function isAdmin() {
+      return signedIn() && request.auth.token.admin == true;
+    }
+
+    function profileExists(uid) {
+      return exists(/databases/$(database)/documents/profiles/$(uid));
+    }
+
+    function profileData(uid) {
+      return get(/databases/$(database)/documents/profiles/$(uid)).data;
+    }
+
+    // The real username gate (13 §A8): a claimed, non-null handle on the profile.
+    function hasUsername(uid) {
+      return profileExists(uid) && profileData(uid).username != null;
+    }
+
+    // The author-denormalization is only trustworthy if it matches the profile.
+    function authorUsernameMatches(uid, claimed) {
+      return hasUsername(uid) && claimed == profileData(uid).username;
+    }
+
+    function submissionData(id) {
+      return get(/databases/$(database)/documents/submissions/$(id)).data;
+    }
+
+    function canReadSubmission(id) {
+      return exists(/databases/$(database)/documents/submissions/$(id))
+        && (submissionData(id).status == 'published'
+          || isAdmin()
+          || isOwner(submissionData(id).authorUid));
+    }
+
+    function isNullableString(value) {
+      return value == null || value is string;
+    }
+
+    function isReportReason(reason) {
+      return reason in ['spam', 'abuse', 'plagiarism', 'inaccurate', 'other'];
+    }
+
+    function reportKeys() {
+      return [
+        'submissionId',
+        'submissionType',
+        'submissionTitle',
+        'submissionAuthorUid',
+        'submissionAuthorUsername',
+        'reporterUid',
+        'reporterUsername',
+        'reason',
+        'details',
+        'status',
+        'createdAt',
+        'reviewedAt',
+        'reviewedBy',
+      ];
+    }
+
+    function hasExactReportKeys(data) {
+      return data.keys().hasOnly(reportKeys()) && data.keys().hasAll(reportKeys());
+    }
+
+    // ---------- PROFILES (public read; created by bootstrapProfile) ----------
+    match /profiles/{uid} {
+      allow read: if true;
+      // Created server-side by the bootstrapProfile callable (13 §A2).
+      allow create: if false;
+      // Client edits displayName/bio only. username is pinned (claimed via the
+      // claimUsername callable and immutable thereafter); createdAt and photoURL pinned.
+      allow update: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(
+             ['displayName', 'username', 'bio', 'photoURL', 'createdAt'])
+        && request.resource.data.username == resource.data.username
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.photoURL == resource.data.photoURL
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() >= 1
+        && request.resource.data.displayName.size() <= 80
+        && request.resource.data.bio is string
+        && request.resource.data.bio.size() <= 500;
+      // Account deletion is the deleteAccount callable (tombstones the corpus).
+      allow delete: if false;
+    }
+
+    // ---------- PRIVATE USERS (owner-only; created by bootstrapProfile) ----------
+    match /privateUsers/{uid} {
+      allow read: if isOwner(uid);
+      allow create: if false;
+      // Client mutates only blockedUids (13 §A7). email/providerId/lastLoginAt pinned
+      // (lastLoginAt is maintained by bootstrapProfile). Block list capped at 500.
+      allow update: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(
+             ['email', 'providerId', 'lastLoginAt', 'blockedUids'])
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.providerId == resource.data.providerId
+        && request.resource.data.lastLoginAt == resource.data.lastLoginAt
+        && request.resource.data.blockedUids is list
+        && request.resource.data.blockedUids.size() <= 500;
+      allow delete: if false;
+
+      match /favorites/{submissionId} {
+        allow read: if isOwner(uid);
+        allow create: if isOwner(uid)
+          && request.resource.data.keys().hasOnly(['savedAt'])
+          && request.resource.data.savedAt == request.time;
+        allow update: if false;
+        allow delete: if isOwner(uid);
+      }
+    }
+
+    // ---------- USERNAMES REGISTRY (world-readable, callable-write-only) ----------
+    // Availability needs existence only; no uid is published (13 §A5).
+    match /usernames/{usernameLower} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // ---------- SUBMISSIONS (callable-write-only except delete) ----------
+    match /submissions/{id} {
+      allow read: if resource.data.status == 'published'
+        || isAdmin()
+        || isOwner(resource.data.authorUid);
+      // createSubmission callable.
+      allow create: if false;
+      // updateSubmission / setSubmissionStatus / voteSubmission callables (13 §A4).
+      allow update: if false;
+      allow delete: if isOwner(resource.data.authorUid) || isAdmin();
+
+      // Comments — DIRECT client write (queues offline), gated on a real username.
+      match /comments/{commentId} {
+        allow read: if canReadSubmission(id);
+        allow create: if signedIn()
+          && request.resource.data.keys().hasOnly(
+               ['authorUid', 'authorUsername', 'body', 'createdAt'])
+          && request.resource.data.keys().hasAll(
+               ['authorUid', 'authorUsername', 'body', 'createdAt'])
+          && request.resource.data.authorUid == request.auth.uid
+          && authorUsernameMatches(request.auth.uid, request.resource.data.authorUsername)
+          && request.resource.data.body is string
+          && request.resource.data.body.size() >= 1
+          && request.resource.data.body.size() <= 2000
+          && request.resource.data.createdAt == request.time;
+        allow update: if false;
+        allow delete: if isOwner(resource.data.authorUid) || isAdmin();
+      }
+
+      // Votes — written by the voteSubmission callable; owner reads own vote.
+      match /votes/{uid} {
+        allow read: if isOwner(uid);
+        allow write: if false;
+      }
+
+      // Reports — DIRECT client write (queues offline), one per reporter, gated on
+      // a real username. Resolution is the resolveReport callable, so client
+      // update/delete are closed. Exact key set copied from the web (the best-
+      // engineered rule in abwaan-v2).
+      match /reports/{reporterUid} {
+        allow read: if isAdmin() || isOwner(reporterUid);
+        allow create: if signedIn()
+          && reporterUid == request.auth.uid
+          && hasExactReportKeys(request.resource.data)
+          && request.resource.data.reporterUid == request.auth.uid
+          && authorUsernameMatches(request.auth.uid, request.resource.data.reporterUsername)
+          && request.resource.data.submissionId == id
+          && request.resource.data.submissionType in ['Proverb', 'Poetry']
+          && request.resource.data.submissionTitle is string
+          && request.resource.data.submissionAuthorUid is string
+          && isNullableString(request.resource.data.submissionAuthorUsername)
+          && request.resource.data.reason is string
+          && isReportReason(request.resource.data.reason)
+          && request.resource.data.reason.size() <= 32
+          && request.resource.data.status == 'open'
+          && isNullableString(request.resource.data.details)
+          && (request.resource.data.details == null
+              || request.resource.data.details.size() <= 2000)
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.reviewedAt == null
+          && request.resource.data.reviewedBy == null
+          && !exists(/databases/$(database)/documents/submissions/$(id)/reports/$(reporterUid));
+        allow update: if false;
+        allow delete: if false;
+      }
+    }
+
+    // ---------- RATE LIMITS (server-only bookkeeping) ----------
+    match /rateLimits/{doc} {
+      allow read, write: if false;
+    }
+
+    // ---------- DEFAULT DENY ----------
     match /{document=**} {
-      allow read, write: if true;
+      allow read, write: if false;
     }
   }
 }
