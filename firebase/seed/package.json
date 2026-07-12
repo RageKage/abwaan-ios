@@ -1,0 +1,12 @@
+{
+  "name": "seed",
+  "description": "M1 emulator seeder (12-ROADMAP.md). Also the basis for the future production import script (10 §4, B2) — same validation, same search derivation, Admin SDK either way.",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "seed": "npm --prefix ../functions run build && node seed.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.7.0"
+  }
+}
